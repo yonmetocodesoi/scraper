@@ -30,25 +30,32 @@ class FlixHQScraper(ScraperBase):
         for item in soup.select(".film_list-wrap .flw-item"):
             title = item.select_one(".film-name a")["title"]
             href = item.select_one(".film-name a")["href"]
-            img = item.select_one(".film-poster img")["data-src"]
+            img_el = item.select_one(".film-poster img")
+            img = img_el["data-src"] if img_el.has_attr("data-src") else img_el["src"]
             results.append({
                 "id": href.strip("/"),
                 "title": title,
                 "image": img,
-                "type": "tv" if "tv" in href else "movie"
+                "type": "tv" if "/tv/" in href else "movie"
             })
         return results
 
     async def get_info(self, media_id: str):
         url = f"{self.BASE_URL}/{media_id}"
         soup = await self.get_soup(url)
-        data_id = soup.select_one(".detail_page-watch")["data-id"]
+        watch_btn = soup.select_one(".detail_page-watch")
+        if not watch_btn:
+            raise Exception("Watch button not found")
+        
+        data_id = watch_btn["data-id"]
         title = soup.select_one(".heading-name a").text.strip()
         
         episodes = []
-        if "tv" in media_id:
-            # Lógica para pegar temporadas e episódios via AJAX
-            # Por brevidade no MVP, focamos no fluxo de extração
+        is_tv = "tv" in media_id
+        
+        if is_tv:
+            # Em uma implementação real do Consumet, aqui buscaríamos temporadas/episódios
+            # Para este MVP, retornamos o data_id como ID base
             pass
         else:
             episodes.append({"id": data_id, "title": title})
@@ -56,30 +63,49 @@ class FlixHQScraper(ScraperBase):
         return {
             "title": title,
             "data_id": data_id,
+            "is_tv": is_tv,
             "episodes": episodes
         }
 
-    async def get_sources(self, episode_id: str):
-        # O Consumet usa um extrator externo (eatmynerds) para descriptografar.
-        # Aqui simulamos a chamada para obter o link final.
-        # Em uma implementação real, portaríamos o algoritmo de descriptografia AES.
-        ajax_url = f"{self.BASE_URL}/ajax/movie/episodes/{episode_id}"
+    async def get_sources(self, episode_id: str, is_tv: bool = False):
+        # Diferentes endpoints para filmes e séries
+        if is_tv:
+            ajax_url = f"{self.BASE_URL}/ajax/v2/episode/servers/{episode_id}"
+        else:
+            ajax_url = f"{self.BASE_URL}/ajax/movie/episodes/{episode_id}"
+
         async with httpx.AsyncClient(headers=self.headers) as client:
             resp = await client.get(ajax_url)
             soup = BeautifulSoup(resp.text, "html.parser")
-            server_id = soup.select_one(".nav-item a")["data-linkid"]
+            
+            # Tentar pegar o primeiro servidor disponível
+            server_el = soup.select_one(".nav-item a")
+            if not server_el:
+                # Se falhou no endpoint de filme, tentar o de série (fallback)
+                alt_url = f"{self.BASE_URL}/ajax/v2/episode/servers/{episode_id}" if not is_tv else f"{self.BASE_URL}/ajax/movie/episodes/{episode_id}"
+                resp = await client.get(alt_url)
+                soup = BeautifulSoup(resp.text, "html.parser")
+                server_el = soup.select_one(".nav-item a")
+            
+            if not server_el:
+                raise Exception("Nenhum servidor encontrado para este ID")
+
+            server_id = server_el.get("data-linkid") or server_el.get("data-id")
             
             # Segunda chamada para pegar o link do iframe/fonte
-            source_resp = await client.get(f"{self.BASE_URL}/ajax/movie/episode/server/sources/{server_id}")
-            source_data = source_resp.json()
-            # source_data['link'] contém o link do RabbitStream/UpCloud
-            return source_data
+            if is_tv or "/v2/" in ajax_url:
+                sources_url = f"{self.BASE_URL}/ajax/v2/episode/sources/{server_id}"
+            else:
+                sources_url = f"{self.BASE_URL}/ajax/movie/episode/server/sources/{server_id}"
+
+            source_resp = await client.get(sources_url)
+            return source_resp.json()
 
 flixhq = FlixHQScraper()
 
 @app.get("/")
 async def root():
-    return {"message": "Manus Custom Scraper API is running without blocks"}
+    return {"message": "Manus Custom Scraper API is running"}
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=1)):
@@ -96,11 +122,15 @@ async def info(media_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/watch/{episode_id}")
-async def watch(episode_id: str):
+async def watch(episode_id: str, is_tv: bool = False):
     try:
-        return await flixhq.get_sources(episode_id)
+        return await flixhq.get_sources(episode_id, is_tv)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Tentar detectar automaticamente se falhar
+        try:
+             return await flixhq.get_sources(episode_id, not is_tv)
+        except:
+             raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
